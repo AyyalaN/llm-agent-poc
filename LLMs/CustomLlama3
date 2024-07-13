@@ -1,0 +1,71 @@
+from typing import Any, Dict, Iterator, List, Mapping, Optional
+
+from langchain_core.callbacks.manager import CallbackManagerForLLMRun
+from langchain_core.language_models.llms import LLM
+from langchain_core.outputs import GenerationChunk
+
+from langchain.llms.base import LLM
+import requests
+
+class Llama3(LLM):
+    """A custom chat model that utilizes the GenAI Llama 70B TGI route"""
+    # Example usage:
+    # api_url = "https://your-internal-api.com/generate"
+    # api_key = "your_api_key"
+    # llm = CustomLLM(api_url, api_key)
+
+    # prompt = "Once upon a time"
+    # generated_text = llm(prompt)
+    # print(generated_text)
+
+    def __init__(self, api_url: str, api_key: str):
+        self.api_url = api_url
+        self.api_key = api_key
+
+    def _call(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> str:
+        """Run the LLM on the given input.
+
+        Override this method to implement the LLM logic.
+
+        Args:
+            prompt: The prompt to generate from.
+            stop: Stop words to use when generating. Model output is cut off at the
+                first occurrence of any of the stop substrings.
+                If stop tokens are not supported consider raising NotImplementedError.
+            run_manager: Callback manager for the run.
+            **kwargs: Arbitrary additional keyword arguments. These are usually passed
+                to the model provider API call.
+
+        Returns:
+            The model output as a string. Actual completions SHOULD NOT include the prompt.
+        """
+        response = requests.post(
+            self.api_url,
+            headers={'Authorization': f'Bearer {self.api_key}'},
+            json={'prompt': prompt, 'max_tokens': 100}  # Adjust parameters as needed
+        )
+        response_data = response.json()
+        return response_data['generated_text']
+
+    @property
+    def _identifying_params(self) -> Dict[str, Any]:
+        """Return a dictionary of identifying parameters."""
+        return {
+            # The model name allows users to specify custom token counting
+            # rules in LLM monitoring applications (e.g., in LangSmith users
+            # can provide per token pricing for their model and monitor
+            # costs for the given LLM.)
+            "model_name": "GenAI Llama 3 70B TGI",
+            "model_route": self.api_url
+        }
+
+    @property
+    def _llm_type(self) -> str:
+        """Get the type of language model used by this chat model. Used for logging purposes only."""
+        return "custom"
