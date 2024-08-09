@@ -1,0 +1,60 @@
+<|begin_of_text|><|start_header_id|>function_metadata<|end_header_id|>
+
+[
+    {
+        "type": "function",
+        "function": {
+            "name": "get_stock_price",
+            "description": "Get the stock price of an array of stocks",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "names": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "An array of stocks"
+                    }
+                },
+                "required": [
+                    "names"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_big_stocks",
+            "description": "Get the names of the largest N stocks by market cap",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "number": {
+                        "type": "integer",
+                        "description": "The number of largest stocks to get the names of, e.g. 25"
+                    },
+                    "region": {
+                        "type": "string",
+                        "description": "The region to consider, can be \"US\" or \"World\"."
+                    }
+                },
+                "required": [
+                    "number"
+                ]
+            }
+        }
+    }
+]<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+Get the names of the five largest stocks by market cap<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Generated Response:
+{
+    "name": "get_big_stocks",
+    "arguments": {
+        "number": 5,
+        "region": "US"
+    }
+}<|eot_id|>
