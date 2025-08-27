@@ -1,182 +1,201 @@
 # claims_agent.py
-# pip install a2a-sdk langgraph uvicorn httpx typing_extensions
-
-import os
-import re
 import asyncio
-import httpx
-from typing import TypedDict, Literal, Optional
+from typing import TypedDict, Optional
+from uuid import uuid4
 
-# --- LangGraph bits ---
+import uvicorn
+import httpx
+
 from langgraph.graph import StateGraph, START, END
 
-# --- A2A server bits ---
-from a2a.server.agent_execution.agent_executor import AgentExecutor
-from a2a.server.agent_execution.context import RequestContext
-from a2a.server.events.event_queue import EventQueue
-from a2a.server.tasks.task_updater import TaskUpdater
-from a2a.server.apps.jsonrpc.starlette_app import A2AStarletteApplication
-from a2a.server.request_handlers.default_request_handler import DefaultRequestHandler
-from a2a.server.tasks.inmemory_task_store import InMemoryTaskStore
-from a2a.server.tasks.inmemory_push_notification_config_store import InMemoryPushNotificationConfigStore
-from a2a.server.tasks.base_push_notification_sender import BasePushNotificationSender
+from a2a.server.apps import A2AStarletteApplication
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.tasks import InMemoryTaskStore
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
 
-# --- A2A client bits for delegation ---
-from a2a.client.client import ClientConfig
-from a2a.client.client_factory import ClientFactory
-from a2a.client.card_resolver import A2ACardResolver
-from a2a.utils.message import new_agent_text_message, get_message_text
-from a2a.types import AgentCard, AgentCapabilities, AgentSkill, AgentInterface, TransportProtocol, Message
-# TextPart exists in the types module in recent SDKs; fallback below if import path differs
-try:
-    from a2a.types import TextPart  # >= current releases
-except Exception:  # pragma: no cover
-    from a2a.types import Part as TextPart  # fallback if SDK aliases text parts
+from a2a.client import A2ACardResolver, A2AClient
+from a2a.types import (
+    AgentCapabilities,
+    AgentCard,
+    AgentSkill,
+    Message,
+    MessageSendParams,
+    SendMessageRequest,
+    Part,
+    TextPart,
+)
+from a2a.utils import new_agent_text_message, get_message_text
+
 
 # --------------------------
-# Demo "database"
+# Demo data (hardcoded)
 # --------------------------
-CLAIMS = {
-    "CLM-1001": {"member_id": "M-001", "status": "Pending review", "amount": 1250.00},
-    "CLM-1002": {"member_id": "M-002", "status": "Approved", "amount": 340.10},
-    "CLM-1003": {"member_id": "M-001", "status": "Denied", "amount": 980.55},
+CLAIMS_DB = {
+    "CLM-1001": {
+        "member_id": "M-001",
+        "status": "Pending review",
+        "amount": 250.0,
+        "date": "2025-06-10",
+        "diagnosis_code": "I10",
+        "procedure_code": "93000",
+    },
+    "CLM-2002": {
+        "member_id": "M-002",
+        "status": "Approved",
+        "amount": 1320.5,
+        "date": "2025-05-22",
+        "diagnosis_code": "E11.9",
+        "procedure_code": "80050",
+    },
 }
 
+MED_AGENT_URL = "http://localhost:9102"   # target for delegation
+
+
 # --------------------------
-# LangGraph state & helpers
+# LangGraph State
 # --------------------------
 class ClaimsState(TypedDict, total=False):
     input: str
     claim_id: Optional[str]
-    route: Literal["details", "status", "delegate_mr"]
-    result: str
+    result: Optional[str]
 
-CLAIM_ID_RE = re.compile(r"(CLM-\d{4})", re.I)
-
-def parse_claim_id(text: str) -> Optional[str]:
-    m = CLAIM_ID_RE.search(text or "")
-    return m.group(1).upper() if m else None
-
-def route_intent(state: ClaimsState) -> ClaimsState:
-    text = (state.get("input") or "").lower()
-    claim_id = parse_claim_id(text)
-    state["claim_id"] = claim_id
-
-    if any(k in text for k in ["medical record", "mr", "summary of record", "summarize record", "chart note"]):
-        state["route"] = "delegate_mr"
-    elif "status" in text or "is it approved" in text:
-        state["route"] = "status"
-    else:
-        state["route"] = "details"
-    return state
-
-def node_details(state: ClaimsState) -> ClaimsState:
-    cid = state.get("claim_id")
-    if not cid or cid not in CLAIMS:
-        state["result"] = "Sorry, I couldn’t find that claim."
-        return state
-    data = CLAIMS[cid]
-    state["result"] = f"Claim {cid}: member={data['member_id']}, amount=${data['amount']:.2f}, status={data['status']}."
-    return state
-
-def node_status(state: ClaimsState) -> ClaimsState:
-    cid = state.get("claim_id")
-    if not cid or cid not in CLAIMS:
-        state["result"] = "Sorry, I couldn’t find that claim."
-        return state
-    state["result"] = f"Claim {cid} status: {CLAIMS[cid]['status']}."
-    return state
-
-async def call_remote_agent(base_url: str, text: str) -> str:
-    async with httpx.AsyncClient(timeout=30) as http:
-        # Resolve the peer agent's card
-        resolver = A2ACardResolver(http, base_url=base_url)
-        card = await resolver.get_agent_card()
-
-        # Build an A2A client (JSON-RPC streaming by default)
-        client = ClientFactory(ClientConfig(streaming=True, supported_transports=[TransportProtocol.jsonrpc])).create_client(card)
-
-        # Build a USER message for the peer
-        msg = Message(role="user", parts=[TextPart(text=text)])
-
-        # Send and consume the stream; return final text
-        final_text = ""
-        async for event in client.send_message(msg):
-            # The client yields either (Task, UpdateEvent) tuples or a final Message
-            if isinstance(event, tuple):
-                # We could inspect task/status/artifacts, but for this demo we just keep waiting
-                continue
-            else:
-                final_text = get_message_text(event)  # extract concatenated text from final Message
-        await client.close()
-        return final_text or "Peer agent did not return any text."
-
-async def node_delegate_mr(state: ClaimsState) -> ClaimsState:
-    mr_url = os.getenv("MEDICAL_AGENT_URL", "http://127.0.0.1:8002")
-    cid = state.get("claim_id") or "UNKNOWN"
-    prompt = f"Please summarize the medical record for claim {cid}. If needed, ask for missing info."
-    state["result"] = await call_remote_agent(mr_url, prompt)
-    return state
-
-def build_claims_graph() -> StateGraph:
-    g = StateGraph(ClaimsState)
-    g.add_node("route_intent", route_intent)
-    g.add_node("details", node_details)
-    g.add_node("status", node_status)
-    g.add_node("delegate_mr", node_delegate_mr)
-    g.add_edge(START, "route_intent")
-    g.add_conditional_edges(
-        "route_intent",
-        lambda s: s["route"],  # next node name
-        {"details": "details", "status": "status", "delegate_mr": "delegate_mr"}
-    )
-    g.add_edge("details", END)
-    g.add_edge("status", END)
-    g.add_edge("delegate_mr", END)
-    return g
 
 # --------------------------
-# A2A AgentExecutor wrapper
+# Delegation utility
+# --------------------------
+async def delegate_to_med_agent(prompt: str) -> str:
+    async with httpx.AsyncClient(timeout=30) as httpx_client:
+        resolver = A2ACardResolver(httpx_client=httpx_client, base_url=MED_AGENT_URL)
+        public_card = await resolver.get_public_agent_card()
+
+        client = A2AClient(httpx_client=httpx_client, agent_card=public_card)
+
+        message = Message(
+            role="user",
+            parts=[Part(root=TextPart(text=prompt))],
+            messageId=uuid4().hex,
+        )
+        req = SendMessageRequest(
+            id=str(uuid4()), params=MessageSendParams(message=message)
+        )
+        resp = await client.send_message(req)
+        # The success payload's `result` is a Message in this simple example
+        result_dict = resp.model_dump(mode="json", exclude_none=True)
+        # Try common locations for the agent's text
+        parts = (
+            result_dict.get("result", {})
+            .get("parts")
+            or result_dict.get("result", {})
+            .get("message", {})
+            .get("parts")
+            or []
+        )
+        for p in parts:
+            if (p.get("type") or p.get("kind")) == "text":
+                return p.get("text", "")
+        return "Delegation succeeded, but no textual response was found."
+        
+
+# --------------------------
+# Nodes
+# --------------------------
+def route(state: ClaimsState) -> str:
+    text = (state.get("input") or "").lower()
+    if "summary" in text or "record" in text or "medical" in text:
+        return "delegate_to_med"
+    return "handle_claim"
+
+def extract_claim_id(text: str) -> Optional[str]:
+    # naive parse "CLM-xxxx"
+    import re
+    m = re.search(r"(CLM-\d+)", text.upper())
+    return m.group(1) if m else None
+
+async def handle_claim(state: ClaimsState) -> ClaimsState:
+    text = state["input"]
+    claim_id = extract_claim_id(text) or state.get("claim_id")
+    if not claim_id or claim_id not in CLAIMS_DB:
+        return {"result": "Please provide a valid claim id like CLM-1001."}
+    claim = CLAIMS_DB[claim_id]
+    return {
+        "result": (
+            f"Claim {claim_id}: status={claim['status']}, amount=${claim['amount']}, "
+            f"date={claim['date']}, dx={claim['diagnosis_code']}, px={claim['procedure_code']}."
+        )
+    }
+
+async def delegate_to_med(state: ClaimsState) -> ClaimsState:
+    text = state["input"]
+    claim_id = extract_claim_id(text)
+    prefix = f"For member linked to {claim_id}, " if claim_id else ""
+    delegated = await delegate_to_med_agent(
+        f"{prefix}please summarize the relevant recent medical records."
+    )
+    return {"result": f"(Delegated to medical-records) {delegated}"}
+
+
+# --------------------------
+# Compile LangGraph
+# --------------------------
+def build_graph():
+    g = StateGraph(ClaimsState)
+    g.add_node("handle_claim", handle_claim)
+    g.add_node("delegate_to_med", delegate_to_med)
+    g.add_edge(START, "router")
+    g.add_conditional_edges("router", route, {"handle_claim": "handle_claim", "delegate_to_med": "delegate_to_med"})
+    g.add_edge("handle_claim", END)
+    g.add_edge("delegate_to_med", END)
+    g.add_node("router", lambda s: s)  # simple pass-through for conditional start
+    return g.compile()
+
+
+# --------------------------
+# A2A Executor
 # --------------------------
 class ClaimsAgentExecutor(AgentExecutor):
     def __init__(self):
-        self.graph = build_claims_graph()
+        self.app = build_graph()
 
-    async def execute(self, context: RequestContext, event_queue: EventQueue):
-        updater = TaskUpdater(event_queue, context.task_id, context.context_id)
-        await updater.start_work()
-        user_text = context.get_user_input() or "What can you do?"
-        result = await self.graph.ainvoke({"input": user_text})
-        final_msg = new_agent_text_message(result["result"], context_id=context.context_id, task_id=context.task_id)
-        await updater.complete(final_msg)
+    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        user_text = get_message_text(context.message) or ""
+        out = await self.app.ainvoke({"input": user_text})
+        final_text = out.get("result") or "No result."
+        event_queue.enqueue_event(new_agent_text_message(final_text))
 
-# --------------------------
-# Agent Card
-# --------------------------
-CLAIMS_CARD = AgentCard(
-    name="ClaimsAgent",
-    description="Answers questions about health insurance claims; can delegate to MedicalRecordsAgent.",
-    skills=[
-        AgentSkill(id="get_claim_details", name="Get Claim Details", description="Return details for a claim ID."),
-        AgentSkill(id="get_claim_status",  name="Get Claim Status",  description="Return status for a claim ID."),
-    ],
-    capabilities=AgentCapabilities(streaming=True),
-    preferred_transport=TransportProtocol.jsonrpc,
-)
+    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
+        raise Exception("cancel not supported")
+
 
 # --------------------------
-# Build A2A app (Starlette)
+# Boot the server
 # --------------------------
-_task_store = InMemoryTaskStore()
-_push_store = InMemoryPushNotificationConfigStore()
-_push_sender = BasePushNotificationSender(httpx.AsyncClient(), _push_store)
+if __name__ == "__main__":
+    skill = AgentSkill(
+        id="claims",
+        name="Claims Info & Status",
+        description="Lookup claims and status; can delegate to medical-records for summaries.",
+        tags=["claims", "status", "healthcare"],
+        examples=["status of CLM-1001", "give details for CLM-2002", "summarize medical records for CLM-1001"],
+    )
+    public_card = AgentCard(
+        name="claims-agent",
+        description="Claims agent (demo) that can also delegate to medical-records.",
+        url="http://localhost:9101/",
+        version="1.0.0",
+        default_input_modes=["text"],
+        default_output_modes=["text"],
+        capabilities=AgentCapabilities(streaming=True),
+        skills=[skill],
+    )
 
-app = A2AStarletteApplication.build(
-    agent_card=CLAIMS_CARD,
-    request_handler=DefaultRequestHandler(
+    handler = DefaultRequestHandler(
         agent_executor=ClaimsAgentExecutor(),
-        task_store=_task_store,
-        push_notification_config_store=_push_store,
-        push_notification_sender=_push_sender,
-    ),
-)
+        task_store=InMemoryTaskStore(),
+    )
+    server = A2AStarletteApplication(
+        agent_card=public_card,
+        http_handler=handler,
+    )
+    uvicorn.run(server.build(), host="0.0.0.0", port=9101)

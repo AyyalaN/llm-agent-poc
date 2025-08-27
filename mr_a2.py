@@ -1,174 +1,177 @@
 # medicalrecords_agent.py
-# pip install a2a-sdk langgraph uvicorn httpx typing_extensions
-
-import os
-import re
 import asyncio
+from typing import TypedDict, Optional
+from uuid import uuid4
+
+import uvicorn
 import httpx
-from typing import TypedDict, Literal, Optional
 
 from langgraph.graph import StateGraph, START, END
 
-from a2a.server.agent_execution.agent_executor import AgentExecutor
-from a2a.server.agent_execution.context import RequestContext
-from a2a.server.events.event_queue import EventQueue
-from a2a.server.tasks.task_updater import TaskUpdater
-from a2a.server.apps.jsonrpc.starlette_app import A2AStarletteApplication
-from a2a.server.request_handlers.default_request_handler import DefaultRequestHandler
-from a2a.server.tasks.inmemory_task_store import InMemoryTaskStore
-from a2a.server.tasks.inmemory_push_notification_config_store import InMemoryPushNotificationConfigStore
-from a2a.server.tasks.base_push_notification_sender import BasePushNotificationSender
+from a2a.server.apps import A2AStarletteApplication
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.tasks import InMemoryTaskStore
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
 
-from a2a.client.client import ClientConfig
-from a2a.client.client_factory import ClientFactory
-from a2a.client.card_resolver import A2ACardResolver
-from a2a.utils.message import new_agent_text_message, get_message_text
-from a2a.types import AgentCard, AgentCapabilities, AgentSkill, AgentInterface, TransportProtocol, Message
-try:
-    from a2a.types import TextPart
-except Exception:  # pragma: no cover
-    from a2a.types import Part as TextPart
+from a2a.client import A2ACardResolver, A2AClient
+from a2a.types import (
+    AgentCapabilities,
+    AgentCard,
+    AgentSkill,
+    Message,
+    MessageSendParams,
+    SendMessageRequest,
+    Part,
+    TextPart,
+)
+from a2a.utils import new_agent_text_message, get_message_text
+
 
 # --------------------------
-# Demo "database"
+# Demo data (hardcoded)
 # --------------------------
-RECORDS = {
-    "CLM-1001": {
-        "diagnoses": ["Hypertension"],
-        "procedures": ["Basic metabolic panel"],
-        "notes": "BP elevated; lifestyle counseling provided."
-    },
-    "CLM-1002": {
-        "diagnoses": ["Type 2 Diabetes"],
-        "procedures": ["A1C test"],
-        "notes": "A1C improved; continue metformin."
-    },
-    "CLM-1003": {
-        "diagnoses": ["Migraine"],
-        "procedures": ["Neuro eval"],
-        "notes": "Trial triptan; follow-up in 4 weeks."
-    },
+MEDICAL_DB = {
+    "M-001": [
+        {"date": "2025-05-01", "note": "BP elevated; start lisinopril 10mg."},
+        {"date": "2025-06-11", "note": "Normal EKG. Follow-up in 6 months."},
+    ],
+    "M-002": [
+        {"date": "2025-04-14", "note": "A1C 7.1%; continue metformin."},
+        {"date": "2025-05-23", "note": "Comprehensive metabolic panel within normal limits."},
+    ],
 }
 
-class MRState(TypedDict, total=False):
+CLAIMS_AGENT_URL = "http://localhost:9101"   # target for delegation
+
+
+# --------------------------
+# LangGraph State
+# --------------------------
+class MedState(TypedDict, total=False):
     input: str
-    claim_id: Optional[str]
-    route: Literal["details", "summary", "delegate_claims"]
-    result: str
+    member_id: Optional[str]
+    result: Optional[str]
 
-CLAIM_ID_RE = re.compile(r"(CLM-\d{4})", re.I)
 
-def parse_claim_id(text: str) -> Optional[str]:
-    m = CLAIM_ID_RE.search(text or "")
-    return m.group(1).upper() if m else None
+# --------------------------
+# Delegation utility
+# --------------------------
+async def delegate_to_claims(prompt: str) -> str:
+    async with httpx.AsyncClient(timeout=30) as httpx_client:
+        resolver = A2ACardResolver(httpx_client=httpx_client, base_url=CLAIMS_AGENT_URL)
+        public_card = await resolver.get_public_agent_card()
+        client = A2AClient(httpx_client=httpx_client, agent_card=public_card)
+        message = Message(
+            role="user",
+            parts=[Part(root=TextPart(text=prompt))],
+            messageId=uuid4().hex,
+        )
+        req = SendMessageRequest(id=str(uuid4()), params=MessageSendParams(message=message))
+        resp = await client.send_message(req)
+        rd = resp.model_dump(mode="json", exclude_none=True)
+        parts = (
+            rd.get("result", {}).get("parts")
+            or rd.get("result", {}).get("message", {}).get("parts")
+            or []
+        )
+        for p in parts:
+            if (p.get("type") or p.get("kind")) == "text":
+                return p.get("text", "")
+        return "Delegation succeeded, but no textual response was found."
 
-def route_intent(state: MRState) -> MRState:
-    text = (state.get("input") or "").lower()
-    claim_id = parse_claim_id(text)
-    state["claim_id"] = claim_id
 
-    if any(k in text for k in ["status", "claim details", "what is the claim", "is it approved"]):
-        state["route"] = "delegate_claims"
-    elif any(k in text for k in ["summary", "summarize", "overview"]):
-        state["route"] = "summary"
-    else:
-        state["route"] = "details"
-    return state
+# --------------------------
+# Helpers
+# --------------------------
+def guess_member_id(text: str) -> Optional[str]:
+    import re
+    m = re.search(r"(M-\d+)", text.upper())
+    return m.group(1) if m else None
 
-def node_details(state: MRState) -> MRState:
-    cid = state.get("claim_id")
-    rec = RECORDS.get(cid or "", None)
-    if not rec:
-        state["result"] = "No medical record found."
-        return state
-    state["result"] = f"Record for {cid}: diagnoses={rec['diagnoses']}, procedures={rec['procedures']}."
-    return state
+def route(state: MedState) -> str:
+    t = (state.get("input") or "").lower()
+    if "claim" in t or "status" in t:
+        return "delegate_to_claims"
+    return "summarize_records"
 
-def node_summary(state: MRState) -> MRState:
-    cid = state.get("claim_id")
-    rec = RECORDS.get(cid or "", None)
-    if not rec:
-        state["result"] = "No medical record to summarize."
-        return state
-    state["result"] = (
-        f"Summary for {cid}: {', '.join(rec['diagnoses'])}. "
-        f"Procedures: {', '.join(rec['procedures'])}. "
-        f"Notes: {rec['notes']}"
-    )
-    return state
+async def summarize_records(state: MedState) -> MedState:
+    t = state["input"]
+    member = guess_member_id(t) or state.get("member_id")
+    if not member or member not in MEDICAL_DB:
+        return {"result": "Please provide a valid member id like M-001."}
+    items = MEDICAL_DB[member][-3:]  # latest up to 3
+    lines = [f"- {it['date']}: {it['note']}" for it in items]
+    return {"result": f"Medical summary for {member}:\n" + "\n".join(lines)}
 
-async def call_remote_agent(base_url: str, text: str) -> str:
-    async with httpx.AsyncClient(timeout=30) as http:
-        resolver = A2ACardResolver(http, base_url=base_url)
-        card = await resolver.get_agent_card()
-        client = ClientFactory(ClientConfig(streaming=True, supported_transports=[TransportProtocol.jsonrpc])).create_client(card)
-        msg = Message(role="user", parts=[TextPart(text=text)])
-        final_text = ""
-        async for event in client.send_message(msg):
-            if isinstance(event, tuple):
-                continue
-            else:
-                final_text = get_message_text(event)
-        await client.close()
-        return final_text or "Peer agent did not return any text."
+async def delegate_to_claims_node(state: MedState) -> MedState:
+    t = state["input"]
+    member = guess_member_id(t)
+    prefix = f"For member {member}, " if member else ""
+    delegated = await delegate_to_claims(f"{prefix}what's the status of the related claims?")
+    return {"result": f"(Delegated to claims) {delegated}"}
 
-async def node_delegate_claims(state: MRState) -> MRState:
-    claims_url = os.getenv("CLAIMS_AGENT_URL", "http://127.0.0.1:8001")
-    cid = state.get("claim_id") or "UNKNOWN"
-    prompt = f"Please provide claim details and current status for {cid}."
-    state["result"] = await call_remote_agent(claims_url, prompt)
-    return state
 
-def build_mr_graph() -> StateGraph:
-    g = StateGraph(MRState)
-    g.add_node("route_intent", route_intent)
-    g.add_node("details", node_details)
-    g.add_node("summary", node_summary)
-    g.add_node("delegate_claims", node_delegate_claims)
-    g.add_edge(START, "route_intent")
-    g.add_conditional_edges(
-        "route_intent",
-        lambda s: s["route"],
-        {"details": "details", "summary": "summary", "delegate_claims": "delegate_claims"}
-    )
-    g.add_edge("details", END)
-    g.add_edge("summary", END)
-    g.add_edge("delegate_claims", END)
-    return g
+# --------------------------
+# Compile LangGraph
+# --------------------------
+def build_graph():
+    g = StateGraph(MedState)
+    g.add_node("summarize_records", summarize_records)
+    g.add_node("delegate_to_claims", delegate_to_claims_node)
+    g.add_node("router", lambda s: s)
+    g.add_edge(START, "router")
+    g.add_conditional_edges("router", route, {"summarize_records": "summarize_records", "delegate_to_claims": "delegate_to_claims"})
+    g.add_edge("summarize_records", END)
+    g.add_edge("delegate_to_claims", END)
+    return g.compile()
 
+
+# --------------------------
+# A2A Executor
+# --------------------------
 class MedicalRecordsExecutor(AgentExecutor):
     def __init__(self):
-        self.graph = build_mr_graph()
+        self.app = build_graph()
 
-    async def execute(self, context: RequestContext, event_queue: EventQueue):
-        updater = TaskUpdater(event_queue, context.task_id, context.context_id)
-        await updater.start_work()
-        user_text = context.get_user_input() or "What can you do?"
-        result = await self.graph.ainvoke({"input": user_text})
-        final_msg = new_agent_text_message(result["result"], context_id=context.context_id, task_id=context.task_id)
-        await updater.complete(final_msg)
+    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        user_text = get_message_text(context.message) or ""
+        out = await self.app.ainvoke({"input": user_text})
+        final_text = out.get("result") or "No result."
+        event_queue.enqueue_event(new_agent_text_message(final_text))
 
-MR_CARD = AgentCard(
-    name="MedicalRecordsAgent",
-    description="Answers questions about medical records and can summarize; can delegate to ClaimsAgent.",
-    skills=[
-        AgentSkill(id="get_record_details", name="Get Record Details", description="Return medical record facts for a claim ID."),
-        AgentSkill(id="summarize_record",  name="Summarize Medical Record", description="Return a brief summary for a claim ID."),
-    ],
-    capabilities=AgentCapabilities(streaming=True),
-    preferred_transport=TransportProtocol.jsonrpc,
-)
+    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
+        raise Exception("cancel not supported")
 
-_task_store = InMemoryTaskStore()
-_push_store = InMemoryPushNotificationConfigStore()
-_push_sender = BasePushNotificationSender(httpx.AsyncClient(), _push_store)
 
-app = A2AStarletteApplication.build(
-    agent_card=MR_CARD,
-    request_handler=DefaultRequestHandler(
+# --------------------------
+# Boot the server
+# --------------------------
+if __name__ == "__main__":
+    skill = AgentSkill(
+        id="medical-records",
+        name="Medical Records",
+        description="Summarize and fetch medical records; can delegate to claims.",
+        tags=["medical", "records", "summary"],
+        examples=["summarize records for M-001", "claim status for M-002", "medical record summary"],
+    )
+    public_card = AgentCard(
+        name="medical-records-agent",
+        description="Medical records agent (demo) that can also delegate to claims.",
+        url="http://localhost:9102/",
+        version="1.0.0",
+        default_input_modes=["text"],
+        default_output_modes=["text"],
+        capabilities=AgentCapabilities(streaming=True),
+        skills=[skill],
+    )
+
+    handler = DefaultRequestHandler(
         agent_executor=MedicalRecordsExecutor(),
-        task_store=_task_store,
-        push_notification_config_store=_push_store,
-        push_notification_sender=_push_sender,
-    ),
-)
+        task_store=InMemoryTaskStore(),
+    )
+    server = A2AStarletteApplication(
+        agent_card=public_card,
+        http_handler=handler,
+    )
+    uvicorn.run(server.build(), host="0.0.0.0", port=9102)
