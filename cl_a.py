@@ -1,208 +1,313 @@
-# claims_agent.py
-# A LangGraph stategraph agent specialized for Claims (status/info/materials).
-# Compatible with the Google A2A sample agent_executor.py expectations.
+# A2A-compliant Claims Agent (LangGraph StateGraph + hardcoded tools)
+# - Collaborates with mr_agent via peer-directed Message (metadata relay hints)
+# - Streams status/artifact events and user-facing messages
+
 from __future__ import annotations
 
-import re
-from typing import Any, AsyncGenerator, Annotated, TypedDict, Optional
-from uuid import uuid4
+import os
+from typing import Any, Dict
+
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
+from a2a.server.handlers import DefaultRequestHandler
+from a2a.server.apps import A2AStarletteApplication
+from a2a.server.task_store import InMemoryTaskStore
+
+from a2a.types import (
+    AgentCard,
+    AgentSkill,
+    AgentCapabilities,
+    TaskState,
+    TaskStatus,
+    TaskStatusUpdateEvent,
+    TaskArtifactUpdateEvent,
+)
+from a2a.utils import new_text_artifact, new_agent_text_message
 
 from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
-from langchain_core.messages import HumanMessage, AIMessage
 
-
-class ClaimsState(TypedDict, total=False):
-    messages: Annotated[list, add_messages]
-    intent: str
-    params: dict
-    result: str
-
-
-# ---- Hardcoded "tools" with in-memory dicts ----
-
-# minimal claim corpus
-_CLAIMS: dict[str, dict[str, Any]] = {
+# ---------------------------
+# Hardcoded claims "data" + tools
+# ---------------------------
+CLAIMS: Dict[str, Dict[str, Any]] = {
     "C-1001": {
-        "member_id": "M-7788",
-        "status": "Pending review",
-        "amount": 1200.55,
-        "service_date": "2025-07-05",
-        "provider": "Downtown Imaging Center",
+        "status": "Pending Review",
+        "provider": "Acme Clinic",
+        "service_date": "2025-07-18",
+        "billed_amount": 1280.00,
+        "allowed_amount": 980.00,
+        "materials": {
+            "EOB": "EOB: services billed on 2025-07-18, pending adjudication.",
+            "Notes": "Provider notes mention follow-up labs in 4 weeks.",
+        },
         "mr_ids": ["MR-2001"],
-        "notes": "Awaiting medical records from provider.",
     },
-    "C-1002": {
-        "member_id": "M-9911",
-        "status": "Approved",
-        "amount": 245.75,
-        "service_date": "2025-06-14",
-        "provider": "Green Valley Clinic",
+    "C-2002": {
+        "status": "Paid",
+        "provider": "Metro Health",
+        "service_date": "2025-06-02",
+        "billed_amount": 420.00,
+        "allowed_amount": 315.00,
+        "materials": {
+            "EOB": "EOB: claim paid at contracted rate.",
+            "Notes": "No outstanding actions.",
+        },
         "mr_ids": ["MR-2002"],
-        "notes": "Paid on 2025-07-01.",
     },
 }
 
-# claim-linked "materials" (pretend attachments list)
-_CLAIM_MATERIALS: dict[str, list[str]] = {
-    "C-1001": ["MR-2001", "IMG-CT-734", "FAX-REQ-0821"],
-    "C-1002": ["MR-2002", "PDF-EOB-1002"],
+MR_TO_CLAIMS: Dict[str, list[str]] = {
+    "MR-2001": ["C-1001"],
+    "MR-2002": ["C-2002"],
 }
-
-
-def _get_claim_id(text: str) -> Optional[str]:
-    m = re.search(r"\bC-\d{4}\b", text, flags=re.I)
-    return m.group(0).upper() if m else None
-
 
 def tool_get_claim_status(claim_id: str) -> str:
-    c = _CLAIMS.get(claim_id)
+    c = CLAIMS.get(claim_id)
     if not c:
         return f"Claim {claim_id} not found."
-    return f"Claim {claim_id} status: {c['status']}"
+    return f"Claim {claim_id} status: {c['status']}."
 
-
-def tool_get_claim_info(claim_id: str, field: str) -> str:
-    c = _CLAIMS.get(claim_id)
+def tool_get_claim_info(claim_id: str) -> str:
+    c = CLAIMS.get(claim_id)
     if not c:
         return f"Claim {claim_id} not found."
-    if field not in c:
-        return f"Field '{field}' not found on claim {claim_id}."
-    return f"{field.replace('_', ' ').title()} for {claim_id}: {c[field]}"
+    return (
+        f"Claim {claim_id} at {c['provider']} for {c['service_date']}. "
+        f"Billed ${c['billed_amount']:.2f}, allowed ${c['allowed_amount']:.2f}."
+    )
 
+def tool_get_material(claim_id: str, name: str) -> str:
+    c = CLAIMS.get(claim_id)
+    if not c:
+        return f"Claim {claim_id} not found."
+    mat = c.get("materials", {}).get(name)
+    return mat or f"No material '{name}' for claim {claim_id}."
 
-def tool_get_claim_materials(claim_id: str) -> str:
-    items = _CLAIM_MATERIALS.get(claim_id, [])
-    if not items:
-        return f"No materials found for claim {claim_id}."
-    return f"Materials for {claim_id}: " + ", ".join(items)
+def tool_request_mr_detail(claim_id: str, topic: str) -> str:
+    return f"@mr_agent Please provide {topic} for {claim_id}."
 
+def tool_find_claims_by_mr(mr_id: str) -> str:
+    ids = MR_TO_CLAIMS.get(mr_id.upper(), [])
+    return (f"No claims linked to {mr_id}." if not ids else f"Claims linked to {mr_id}: " + ", ".join(ids))
 
-# ---- Node functions ----
+# ---------------------------
+# Minimal LangGraph: route -> exec
+# ---------------------------
+class ClaimsState(dict):
+    """{'prompt': str, 'claim_id': str, 'result': str, 'peer_request': str|None, 'peer_reply': str|None, 'is_peer': bool}"""
+    pass
 
-def classify(state: ClaimsState) -> ClaimsState:
-    """Tiny rule-based router: status / info / materials."""
-    text = state["messages"][-1].content.lower()
-    claim_id = _get_claim_id(text) or "C-1001"  # default demo ID
-    # Choose intent/field
-    if "status" in text:
-        intent, field = "status", ""
-    elif any(k in text for k in ("material", "attachment", "document", "docs")):
-        intent, field = "materials", ""
+def claims_router(state: ClaimsState) -> str:
+    p = state["prompt"].lower()
+    # peer queries from MR like: "find claim for MR-xxxx"
+    if state.get("is_peer") and "mr-" in p and "claim" in p:
+        return "mr_claim_assoc"
+    if "status" in p:
+        return "status"
+    if "info" in p or "details" in p:
+        return "info"
+    if "eob" in p:
+        state["material_name"] = "EOB"
+        return "material"
+    if "notes" in p:
+        state["material_name"] = "Notes"
+        return "material"
+    # MR topics we don't have locally
+    if any(k in p for k in ["medication", "meds", "diagnos", "allerg", "assessment", "summar"]):
+        state["mr_topic"] = "medical summary" if "summar" in p else "requested MR details"
+        return "mr_collab"
+    return "info"
+
+def claims_exec(state: ClaimsState) -> ClaimsState:
+    cid = state["claim_id"]
+    action = state["action"]
+    if action == "status":
+        state["result"] = tool_get_claim_status(cid)
+    elif action == "info":
+        state["result"] = tool_get_claim_info(cid)
+    elif action == "material":
+        name = state.get("material_name", "EOB")
+        state["result"] = tool_get_material(cid, name)
+    elif action == "mr_claim_assoc":
+        # reverse lookup: MR → Claim(s)
+        mr_id = None
+        for token in state["prompt"].split():
+            if token.upper().startswith("MR-"):
+                mr_id = token.upper().rstrip(".,)")
+                break
+        mr_id = mr_id or "MR-2001"
+        summary = tool_find_claims_by_mr(mr_id)
+        state["result"] = f"[Claims] {summary}"
+        state["peer_reply"] = f"CLAIMS_ASSOC_RESPONSE: {summary}"
+    elif action == "mr_collab":
+        topic = state.get("mr_topic", "medical details")
+        state["result"] = f"Collaborating with MR for {cid}: requesting {topic}."
+        state["peer_request"] = tool_request_mr_detail(cid, topic)
     else:
-        # heuristic field detection
-        if any(k in text for k in ("amount", "billed", "paid")):
-            intent, field = "info", "amount"
-        elif any(k in text for k in ("service date", "dos", "date of service")):
-            intent, field = "info", "service_date"
-        elif "provider" in text:
-            intent, field = "info", "provider"
-        elif any(k in text for k in ("mr", "medical record")):
-            # NOTE: Claims agent *doesn't* have record access;
-            # this surfaces a hint to collaborate via A2A.
-            intent, field = "handoff_hint", ""
-        else:
-            intent, field = "info", "notes"
+        state["result"] = tool_get_claim_info(cid)
+    return state
 
-    return {"intent": intent, "params": {"claim_id": claim_id, "field": field}}
+def build_claims_graph():
+    g = StateGraph(ClaimsState)
+    g.add_node("exec", claims_exec)
 
+    def decide(state: ClaimsState):
+        state["action"] = claims_router(state)
+        return "exec"
 
-def fetch(state: ClaimsState) -> ClaimsState:
-    intent = state["intent"]
-    claim_id = state["params"]["claim_id"]
-    field = state["params"]["field"]
+    g.set_entry_point(decide)
+    g.add_edge("exec", END)
+    return g.compile()
 
-    if intent == "status":
-        msg = tool_get_claim_status(claim_id)
-    elif intent == "materials":
-        msg = tool_get_claim_materials(claim_id)
-    elif intent == "info":
-        msg = tool_get_claim_info(claim_id, field)
-    else:
-        # handoff hint: tell the orchestrator/user which MR to consult
-        mr_ids = _CLAIMS.get(claim_id, {}).get("mr_ids", [])
-        if mr_ids:
-            msg = (
-                f"[Claims Agent] I don’t have medical-record access. "
-                f"Please consult the MR agent for {', '.join(mr_ids)}."
-            )
-        else:
-            msg = "[Claims Agent] No linked medical record IDs found."
-
-    prefix = "[Claims Agent] "
-    return {"result": prefix + msg}
-
-
-def finalize(state: ClaimsState) -> ClaimsState:
-    out = state["result"]
-    return {"messages": [AIMessage(content=out)], "result": out}
-
-
-# ---- Agent class ----
-
+# ---------------------------
+# Agent + Executor
+# ---------------------------
 class ClaimsAgent:
-    """Claims agent (LangGraph stategraph).
-    Provides:
-      - invoke(query, sessionId=None) -> dict
-      - stream(query, sessionId=None) -> async generator of dicts
-    """
-    SUPPORTED_CONTENT_TYPES = ["text/plain"]
-
     def __init__(self) -> None:
-        builder = StateGraph(ClaimsState)
-        builder.add_node("classify", classify)
-        builder.add_node("fetch", fetch)
-        builder.add_node("finalize", finalize)
+        self.graph = build_claims_graph()
 
-        def router(s: ClaimsState) -> str:
-            return "fetch"
+    async def run(self, prompt: str, claim_id: str, is_peer: bool = False) -> ClaimsState:
+        init = ClaimsState(prompt=prompt, claim_id=claim_id, result="", peer_request=None, peer_reply=None, is_peer=is_peer)
+        out = self.graph.invoke(init)
+        return out
 
-        builder.set_entry_point("classify")
-        builder.add_conditional_edges("classify", router, {"fetch": "fetch"})
-        builder.add_edge("fetch", "finalize")
-        builder.add_edge("finalize", END)
+class ClaimsAgentExecutor(AgentExecutor):
+    def __init__(self) -> None:
+        self.agent = ClaimsAgent()
 
-        self.graph = builder.compile()
+    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        # Extract text & claim id (+ metadata for peer detection)
+        text = ""
+        claim_id = ""
+        incoming_meta = {}
+        try:
+            parts = (getattr(context, "message", None) or {}).get("parts", [])
+            incoming_meta = (getattr(context, "message", None) or {}).get("metadata", {}) or {}
+        except Exception:
+            parts = []
+        for p in parts or []:
+            if p.get("mimeType") == "text/plain" and p.get("text"):
+                if not text:
+                    text = p["text"]
+                if "C-" in p["text"]:
+                    claim_id = p["text"].split("C-")[1].split()[0]
+                    claim_id = f"C-{claim_id}"
+        if not claim_id:
+            claim_id = "C-1001"
 
-    def _mk_state(self, query: str) -> ClaimsState:
-        return {"messages": [HumanMessage(content=query)]}
-
-    def invoke(self, query: str, sessionId: str | None = None) -> dict:
-        result = self.graph.invoke(
-            self._mk_state(query),
-            config={"configurable": {"thread_id": sessionId or str(uuid4())}},
+        await event_queue.enqueue_event(
+            TaskStatusUpdateEvent(
+                status=TaskStatus(state=TaskState.working, message=f"Processing claim {claim_id}"),
+                final=False,
+            )
         )
-        return {
-            "is_task_complete": True,
-            "require_user_input": False,
-            "content": result["result"],
-        }
 
-    async def stream(
-        self, query: str, sessionId: str | None = None
-    ) -> AsyncGenerator[dict, None]:
-        friendly = {
-            "classify": "[Claims Agent] Understanding your request…",
-            "fetch": "[Claims Agent] Retrieving claim information…",
-            "finalize": "[Claims Agent] Preparing the response…",
-        }
-        async for updates in self.graph.astream(
-            self._mk_state(query),
-            stream_mode="updates",
-            config={"configurable": {"thread_id": sessionId or str(uuid4())}},
-        ):
-            for node, data in updates.items():
-                if node == "__end__":
-                    continue
-                if "result" in data:
-                    yield {
-                        "is_task_complete": True,
-                        "require_user_input": False,
-                        "content": data["result"],
-                    }
-                else:
-                    yield {
-                        "is_task_complete": False,
-                        "require_user_input": False,
-                        "content": friendly.get(node, "[Claims Agent] Working…"),
-                    }
+        is_peer = isinstance(incoming_meta, dict) and incoming_meta.get("audience") == "peer"
+        result_state = await self.agent.run(text or "info", claim_id, is_peer=is_peer)
+
+        await event_queue.enqueue_event(
+            TaskArtifactUpdateEvent(artifact=new_text_artifact(result_state["result"]), lastChunk=True)
+        )
+
+        # user-facing message (only if not servicing a peer)
+        if not is_peer:
+            await event_queue.enqueue_event(
+                new_agent_text_message(
+                    result_state["result"],
+                    metadata={"audience": "user", "relay": False},
+                )
+            )
+
+        # peer-directed requests / replies
+        peer_req = result_state.get("peer_request")
+        if peer_req:
+            await event_queue.enqueue_event(
+                new_agent_text_message(
+                    peer_req,
+                    metadata={
+                        "audience": "peer",
+                        "relay": True,
+                        "target_agent": "mr_agent",
+                    },
+                )
+            )
+        peer_reply = result_state.get("peer_reply")
+        if is_peer and peer_reply:
+            await event_queue.enqueue_event(
+                new_agent_text_message(
+                    peer_reply,
+                    metadata={
+                        "audience": "peer",
+                        "relay": True,
+                        "target_agent": "mr_agent",
+                    },
+                )
+            )
+
+        await event_queue.enqueue_event(
+            TaskStatusUpdateEvent(
+                status=TaskStatus(state=TaskState.completed, message="Done"),
+                final=True,
+            )
+        )
+
+    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
+        raise Exception("cancel not supported")
+
+# ---------------------------
+# Agent Card + Server (optional runnable)
+# ---------------------------
+def build_claims_agent_card() -> AgentCard:
+    return AgentCard(
+        name="claims_agent",
+        description="Claims agent: claim status, amounts, materials; collaborates with MR for clinical details.",
+        version="0.1.0",
+        capabilities=AgentCapabilities(streaming=True),
+        inputModes=["text/plain"],
+        outputModes=["text/plain"],
+        skills=[
+            AgentSkill(
+                id="claims.status",
+                name="Get claim status",
+                description="Returns the lifecycle status for a claim.",
+                examples=["What is the status of C-1001?"],
+                tags=["claims", "status"],
+            ),
+            AgentSkill(
+                id="claims.info",
+                name="Get claim info",
+                description="Returns summary info for a claim (provider, service date, amounts).",
+                examples=["Give me details for claim C-2002"],
+                tags=["claims", "lookup"],
+            ),
+            AgentSkill(
+                id="claims.materials",
+                name="Get claim material",
+                description="Returns claim-associated materials (EOB, notes).",
+                examples=["Show the EOB for C-1001"],
+                tags=["claims", "materials"],
+            ),
+            AgentSkill(
+                id="claims.collab.mr",
+                name="Collaborate with MR agent",
+                description="Requests MR details when the question is clinical (meds, dx, allergies, assessment, summary).",
+                examples=["What medications are on the record for C-1001?"],
+                tags=["collaboration", "A2A"],
+            ),
+        ],
+    )
+
+def build_app():
+    request_handler = DefaultRequestHandler(
+        agent_executor=ClaimsAgentExecutor(),
+        task_store=InMemoryTaskStore(),
+    )
+    return A2AStarletteApplication(
+        agent_card=build_claims_agent_card(),
+        http_handler=request_handler,
+    ).build()
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run(build_app(), host="0.0.0.0", port=port)
