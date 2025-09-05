@@ -1,0 +1,9 @@
+<ItemGroup>
+  <PackageReference Include="Atalasoft.dotImage.x64" Version="11.5.0.7296" />
+  <PackageReference Include="Atalasoft.dotImage.PdfReader.x64" Version="11.5.0.7296" />
+  <PackageReference Include="Atalasoft.dotImage.Ocr.x64" Version="11.5.0.7296" />
+  <PackageReference Include="Atalasoft.dotImage.Ocr.OmniPage.x64" Version="11.5.0.7296" />
+  <PackageReference Include="Atalasoft.dotImage.AdvancedDocClean.x64" Version="11.5.0.7296" />
+  <!-- Optional -->
+  <PackageReference Include="Atalasoft.dotImage.WebControls.x64" Version="11.5.0.7296" />
+</ItemGroup>
