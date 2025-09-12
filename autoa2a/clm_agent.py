@@ -9,9 +9,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==== LLM (AutoGen, OpenAI-compatible backends like vLLM/TGI) ====
-from autogen_ext.models.openai import OpenAIChatCompletionClient  # OpenAI-compatible + base_url + headers
+from autogen_ext.models.openai import OpenAIChatCompletionClient  # docs: include_name_in_message, base_url
 
 # ==== A2A SDK (server + client) ====
+# NOTE: If your installed a2a-sdk exposes slightly different module paths or names,
+# adjust these imports accordingly.
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue, TaskStatus
 from a2a.server import A2AServer, DefaultA2ARequestHandler
@@ -24,7 +26,6 @@ from a2a.types import (
     CancelTaskRequest, CancelTaskResponse,
 )
 
-# ==== Web servers ====
 import uvicorn
 import gradio as gr
 
@@ -52,7 +53,7 @@ COLORS = {
 FONTS = {"mono": "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace"}
 
 # --------------------------------------------------------------------------------------
-# SAMPLE DATA (same as before)
+# SAMPLE DATA (enriched with admin-only fields)
 # --------------------------------------------------------------------------------------
 CLAIMS_DB = {
     "CLM-1001": {
@@ -60,6 +61,8 @@ CLAIMS_DB = {
         "mr_id": "MR001",
         "diagnosis": "chest pain; hyperlipidemia",
         "claim_amount": 12450.00,
+        "claim_status": "In Review",              # NEW
+        "eob_notes": "Pending cardiology review", # NEW
         "narrative": "Hospitalization 2 days; cardiology consult; stress test planned."
     },
     "CLM-1002": {
@@ -67,9 +70,23 @@ CLAIMS_DB = {
         "mr_id": "MR002",
         "diagnosis": "ankle sprain",
         "claim_amount": 350.00,
+        "claim_status": "Approved",               # NEW
+        "eob_notes": "Standard ER visit",         # NEW
         "narrative": "ER visit; ankle x-ray negative."
     },
 }
+
+# --------------------------------------------------------------------------------------
+# CLINICAL-INTENT GATE
+# --------------------------------------------------------------------------------------
+CLINICAL_KEYWORDS = {
+    "clinical", "summary", "summarize", "mr", "medical record", "medications",
+    "meds", "allergies", "icd10", "icd-10", "diagnosis", "labs", "vitals",
+    "red flags", "risk", "imaging", "radiology"
+}
+def needs_clinical(user_text: str) -> bool:
+    q = user_text.lower()
+    return any(k in q for k in CLINICAL_KEYWORDS)
 
 # --------------------------------------------------------------------------------------
 # TRANSCRIPT / AUDIT
@@ -173,7 +190,7 @@ async def _call_mr_agent(
     transcript.add("claims_agent", "delegate_start", {"mr_base_url": mr_base_url, "prompt": prompt_text})
     await event_queue.put_status_update(TaskStatus.RUNNING, f"[MR] resolving agent card")
 
-    # Discover & build A2A client from the collaborator's Agent Card (/.well-known/agent.json)
+    # Build A2A client from the collaborator's Agent Card (/.well-known/agent.json)
     mr_client = await A2AClient.get_client_from_agent_card_url(base_url=mr_base_url)
     try:
         req = SendStreamingMessageRequest(
@@ -226,17 +243,29 @@ disposition, allowed_amount_estimate, reasons."""
             "reasons": [text.strip()]
         }
 
+def build_admin_info(claim: Dict[str, Any]) -> Dict[str, Any]:
+    """Local (non-clinical) answer constructed from Claims DB only."""
+    return {
+        "claim_status": claim.get("claim_status"),
+        "claim_amount": claim.get("claim_amount"),
+        "eob_notes": claim.get("eob_notes"),
+        "member_id": claim.get("member_id"),
+        "mr_linked": bool(claim.get("mr_id")),
+    }
+
 # --------------------------------------------------------------------------------------
-# CLAIMS A2A EXECUTOR
+# CLAIMS A2A EXECUTOR (with clinical-intent gating)
 # --------------------------------------------------------------------------------------
 class ClaimsAgentExecutor(AgentExecutor):
     """
     Skill:
-      - evaluate_claim: input 'claim_id=CLM-1001' (optionally with extra notes).
-        Records full inter-agent transcript and returns it alongside the decision.
+      - evaluate_claim: 'claim_id=CLM-1001' (optional natural language).
+        - If the prompt is clinical -> delegate to MR via A2A.
+        - Otherwise answer locally with admin info (no MR calls).
+        Returns transcript for UI relay.
     """
     name = "Claims Agent"
-    version = "1.2.0"  # bumped for UI support
+    version = "1.3.0"  # gating + admin-info + UI support
 
     async def on_send_streaming_message(
         self,
@@ -272,26 +301,40 @@ class ClaimsAgentExecutor(AgentExecutor):
             return
 
         await event_queue.put_status_update(TaskStatus.RUNNING, f"Loaded {claim_id}")
-        transcript.add("claims_agent", "claim_loaded", {"claim_id": claim_id, "has_mr": bool(claim.get("mr_id"))})
+        is_clinical = needs_clinical(user_text)
+        will_delegate = claim.get("mr_id") and is_clinical
+        transcript.add("claims_agent", "routing_decision", {"will_delegate": bool(will_delegate), "is_clinical": is_clinical})
 
         mr_summary: Dict[str, Any] = {}
-        if claim.get("mr_id"):
+        admin_info: Dict[str, Any] = {}
+
+        if will_delegate:
             await event_queue.put_status_update(TaskStatus.RUNNING, f"Delegating to MR Agent for {claim['mr_id']}")
             prompt = f"mr_id={claim['mr_id']}"
             mr_summary = await _call_mr_agent(MR_BASE_URL, prompt, event_queue, transcript)
-
-        await event_queue.put_status_update(TaskStatus.RUNNING, "Adjudicating with LLM")
-        transcript.add("claims_agent", "adjudication_start", {})
-        decision = await evaluate_claim_with_llm(claim, mr_summary)
-        transcript.add("claims_agent", "final_decision", {"decision": decision})
-
-        result = {
-            "correlation_id": corr_id,
-            "claim_id": claim_id,
-            "decision": decision,
-            "mr_summary": mr_summary,
-            "transcript": transcript.events,  # full audit for this request
-        }
+            await event_queue.put_status_update(TaskStatus.RUNNING, "Adjudicating with LLM")
+            transcript.add("claims_agent", "adjudication_start", {})
+            decision = await evaluate_claim_with_llm(claim, mr_summary)
+            transcript.add("claims_agent", "final_decision", {"decision": decision})
+            result = {
+                "mode": "delegated",
+                "correlation_id": corr_id,
+                "claim_id": claim_id,
+                "decision": decision,
+                "mr_summary": mr_summary,
+                "transcript": transcript.events,
+            }
+        else:
+            # Local/admin-only answer (no MR stream)
+            admin_info = build_admin_info(claim)
+            transcript.add("claims_agent", "local_only", {"reason": "admin_query_or_no_keywords"})
+            result = {
+                "mode": "local",
+                "correlation_id": corr_id,
+                "claim_id": claim_id,
+                "admin_info": admin_info,
+                "transcript": transcript.events,
+            }
 
         yield SendStreamingMessageResponse(
             message=Message(role="assistant", parts=[TextPart(text=json.dumps(result, ensure_ascii=False))])
@@ -307,15 +350,15 @@ def build_agent_card(base_url: str) -> AgentCard:
     skill = AgentSkill(
         id="evaluate_claim",
         name="Evaluate Claim",
-        description="End-to-end claim adjudication, delegates to MR Agent when needed; records full transcript.",
+        description="Adjudicates claims; delegates to MR for clinical asks; returns a transcript.",
         tags=["claims","adjudication","medical","audit"],
-        examples=["claim_id=CLM-1001", "claim_id=CLM-1002"],
+        examples=["claim_id=CLM-1001 summarize MR", "claim_id=CLM-1002 show status and EOB notes"],
     )
     return AgentCard(
         name="Claims Agent",
-        description="Evaluates claims, uses MR Agent for clinical summaries, and records an inter-agent transcript.",
+        description="Claims adjudication with on-demand MR delegation and full transcript logging.",
         url=base_url,
-        version="1.2.0",
+        version="1.3.0",
         defaultInputModes=["text"],
         defaultOutputModes=["text"],
         capabilities=AgentCapabilities(streaming=True),
@@ -340,7 +383,7 @@ def start_a2a_server_in_thread():
     return t
 
 # --------------------------------------------------------------------------------------
-# GRADIO VIEWER
+# GRADIO VIEWER (left: chat, right: relay; default shows ONLY MR events)
 # --------------------------------------------------------------------------------------
 def css_theme() -> str:
     c = COLORS; f = FONTS
@@ -376,18 +419,20 @@ h3.title {{ margin: 0 0 8px 0; color: var(--accent); font-weight: 600; }}
 .code {{ white-space: pre-wrap; word-wrap: break-word; }}
 """
 
-def humanize_events(events: List[dict], include: set[str]) -> str:
+def _origin_class(actor: str, kind: str) -> str:
+    if "error" in kind: return "error"
+    if actor == "mr_agent": return "mr"
+    if actor == "claims_agent": return "claims"
+    if actor == "user": return "user"
+    return "status"
+
+def humanize_events(events: List[dict], include: set[str], show_local: bool) -> str:
     """
     Filter + render transcript events into human friendly HTML.
-    include: subset of {"Status", "Messages", "Artifacts", "Errors", "System"}.
-    """
-    def origin_cls(actor: str, kind: str) -> str:
-        if "error" in kind: return "error"
-        if actor == "mr_agent": return "mr"
-        if actor == "claims_agent": return "claims"
-        if actor == "user": return "user"
-        return "status"
 
+    include: subset of {"Status", "Messages", "Artifacts", "Errors"}.
+    show_local: False => only show MR-origin events (default for a truly empty pane in local flows).
+    """
     html_lines: List[str] = []
     seen_status = set()
 
@@ -397,13 +442,16 @@ def humanize_events(events: List[dict], include: set[str]) -> str:
         pay = e.get("payload", {})
         ts = e.get("ts", "")
 
-        # Decide inclusion
+        # Skip local events unless toggle is ON
+        if not show_local and actor != "mr_agent":
+            continue
+
         if kind.startswith("stream_event"):
             msg_text = (pay or {}).get("message_text")
             status = (pay or {}).get("status")
             if status and "Status" in include:
                 key = f"{actor}:{status}"
-                if key not in seen_status:  # de-dup repetitive statuses
+                if key not in seen_status:
                     seen_status.add(key)
                     html_lines.append(
                         f'<div class="a2a-event status"><span class="ts">{ts}</span><b>Status</b> — <i>{actor}</i>: {status}</div>'
@@ -411,39 +459,23 @@ def humanize_events(events: List[dict], include: set[str]) -> str:
             if msg_text and "Messages" in include:
                 clip = msg_text if len(msg_text) < 600 else (msg_text[:600] + "…")
                 html_lines.append(
-                    f'<div class="a2a-event {origin_cls(actor, kind)}"><span class="ts">{ts}</span><b>{actor}</b>: <span class="code">{gr.utils.markdown_to_html(clip)}</span></div>'
+                    f'<div class="a2a-event {_origin_class(actor, kind)}"><span class="ts">{ts}</span><b>{actor}</b>: <span class="code">{gr.utils.markdown_to_html(clip)}</span></div>'
                 )
             artifact = (pay or {}).get("artifact")
             if artifact and "Artifacts" in include:
                 html_lines.append(
-                    f'<div class="a2a-event {origin_cls(actor, kind)}"><span class="ts">{ts}</span><b>{actor} artifact</b>: {artifact}</div>'
+                    f'<div class="a2a-event {_origin_class(actor, kind)}"><span class="ts">{ts}</span><b>{actor} artifact</b>: {artifact}</div>'
                 )
             continue
 
-        if kind == "incoming_request" and "System" in include:
-            text = (pay or {}).get("text","")
-            html_lines.append(
-                f'<div class="a2a-event user"><span class="ts">{ts}</span><b>User</b>: <span class="code">{gr.utils.markdown_to_html(text)}</span></div>'
-            )
-            continue
-
-        if kind == "final_decision" and "Messages" in include:
-            decision = (pay or {}).get("decision", {})
-            pretty = gr.utils.markdown_to_html("```json\n" + json.dumps(decision, indent=2) + "\n```")
-            html_lines.append(
-                f'<div class="a2a-event claims"><span class="ts">{ts}</span><b>Claims decision</b>: {pretty}</div>'
-            )
-            continue
-
-        # errors / other
+        # Other (we hide these by default when show_local=False)
         if "error" in kind and "Errors" in include:
             html_lines.append(
                 f'<div class="a2a-event error"><span class="ts">{ts}</span><b>Error</b>: {pay}</div>'
             )
 
-    return "\n".join(html_lines) or '<div class="a2a-event status">No events (check filters)</div>'
+    return "\n".join(html_lines) or '<div class="a2a-event status">No events</div>'
 
-# Client to call THIS claims agent over A2A
 async def send_to_claims_a2a(base_url: str, text: str) -> dict:
     client = await A2AClient.get_client_from_agent_card_url(base_url=base_url)
     try:
@@ -452,7 +484,6 @@ async def send_to_claims_a2a(base_url: str, text: str) -> dict:
         async for evt in client.send_message_streaming(req):
             msg = getattr(evt, "message", None)
             if isinstance(msg, Message):
-                # We expect a single JSON blob in the final assistant message
                 body = ""
                 for part in (msg.parts or []):
                     if isinstance(part, TextPart):
@@ -469,7 +500,6 @@ async def send_to_claims_a2a(base_url: str, text: str) -> dict:
         except Exception:
             pass
 
-# Build Gradio UI
 def make_ui():
     with gr.Blocks(title="Claims Agent | A2A Viewer", css=css_theme()) as demo:
         gr.Markdown(f"### <span style='color:{COLORS['accent']}'>Claims Agent (A2A) — Demo Viewer</span>")
@@ -477,77 +507,86 @@ def make_ui():
             with gr.Column(scale=5, elem_classes=["section", "chat-wrap"]):
                 gr.Markdown("#### Chat")
                 chat = gr.Chatbot(height=560, show_copy_button=True, avatar_images=(None, None))
-                inp = gr.Textbox(placeholder="Type a prompt, e.g. claim_id=CLM-1001", autofocus=True)
+                inp = gr.Textbox(placeholder="Type a prompt, e.g. claim_id=CLM-1001 summarize MR", autofocus=True)
                 send = gr.Button("Send", variant="primary")
             with gr.Column(scale=5, elem_classes=["section"]):
-                gr.Markdown("#### A2A Transcript")
+                gr.Markdown("#### A2A Relay (MR events)")
                 filters = gr.CheckboxGroup(
-                    choices=["Status", "Messages", "Artifacts", "Errors", "System"],
-                    value=["Status", "Messages", "System"],
+                    choices=["Status", "Messages", "Artifacts", "Errors"],
+                    value=["Status", "Messages"],
                     label="Show",
                 )
+                show_local = gr.Checkbox(value=False, label="Show local events (Claims/System)")
                 transcript_box = gr.HTML(elem_id="transcript_box")
 
         # App state
-        # - history_meta: list of dicts per assistant turn: {"correlation_id":..., "transcript":[...]}
-        history_meta = gr.State([])  # type: ignore[list-item]
+        history_meta = gr.State([])  # one dict per turn: {"correlation_id":..., "transcript":[...]}
         base_url_state = gr.State(f"http://localhost:{CLAIMS_PORT}")
 
-        async def on_send(user_msg, chat_log: List[Tuple[str, str]], meta: List[dict], base_url, shown):
+        async def on_send(user_msg, chat_log: List[Tuple[str, str]], meta: List[dict], base_url, shown, include_local):
             if not user_msg:
                 return gr.update(), chat_log, meta
 
-            # Optimistically add the user message
             chat_log = chat_log + [(user_msg, "")]
-            # Call the A2A server (this process) and get JSON result
             result = await send_to_claims_a2a(base_url, user_msg)
-            # Prepare assistant bubble
-            assistant_text = f"**Decision:** {result.get('decision',{}).get('disposition','?')}\n\n" \
-                             f"**Allowed (est):** ${result.get('decision',{}).get('allowed_amount_estimate','?')}\n\n" \
-                             f"**Reasons:** " + "; ".join(result.get('decision',{}).get('reasons', []))
+
+            # Render assistant bubble:
+            if result.get("mode") == "local":
+                info = result.get("admin_info", {})
+                assistant_text = (
+                    f"**Status:** {info.get('claim_status','?')}\n\n"
+                    f"**Amount:** ${info.get('claim_amount','?')}\n\n"
+                    f"**EOB notes:** {info.get('eob_notes','?')}\n\n"
+                    f"**Member:** {info.get('member_id','?')}  •  **MR linked:** {info.get('mr_linked')}"
+                )
+            else:
+                decision = result.get("decision", {})
+                assistant_text = (
+                    f"**Decision:** {decision.get('disposition','?')}\n\n"
+                    f"**Allowed (est):** ${decision.get('allowed_amount_estimate','?')}\n\n"
+                    f"**Reasons:** " + "; ".join(decision.get('reasons', []))
+                )
             chat_log[-1] = (user_msg, assistant_text)
 
-            # Remember transcript for this turn
             meta = meta + [{
                 "correlation_id": result.get("correlation_id"),
                 "transcript": result.get("transcript", []),
             }]
 
-            # If this is the latest turn, render transcript with current filters
-            html = humanize_events(meta[-1]["transcript"], include=set(shown or []))
+            html = humanize_events(meta[-1]["transcript"], include=set(shown or []), show_local=bool(include_local))
             return "", chat_log, meta, html
 
-        async def on_select(evt: gr.SelectData, chat_log: List[Tuple[str, str]], meta: List[dict], shown):
-            """When user clicks a chat bubble, load its transcript."""
-            # evt.index is (row, col) -> we want the assistant turn index
-            # Each turn is (user, assistant); show transcript for that assistant index
-            row, col = evt.index
-            idx = row  # one assistant per row
+        async def on_select(evt: gr.SelectData, chat_log: List[Tuple[str, str]], meta: List[dict], shown, include_local):
+            idx = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
             if idx is None or idx >= len(meta) or idx < 0:
                 return gr.update()
-            html = humanize_events(meta[idx]["transcript"], include=set(shown or []))
+            html = humanize_events(meta[idx]["transcript"], include=set(shown or []), show_local=bool(include_local))
             return html
 
-        def on_filter_change(shown, meta: List[dict], chat_log: List[Tuple[str,str]]):
+        def on_filter_change(shown, include_local, meta: List[dict]):
             if not meta:
                 return gr.update()
-            # Show transcript for the last turn by default
-            return humanize_events(meta[-1]["transcript"], include=set(shown or []))
+            return humanize_events(meta[-1]["transcript"], include=set(shown or []), show_local=bool(include_local))
 
         send.click(
             on_send,
-            inputs=[inp, chat, history_meta, base_url_state, filters],
+            inputs=[inp, chat, history_meta, base_url_state, filters, show_local],
             outputs=[inp, chat, history_meta, transcript_box],
             queue=True,
         )
         chat.select(
             on_select,
-            inputs=[chat, history_meta, filters],
+            inputs=[chat, history_meta, filters, show_local],
             outputs=[transcript_box],
         )
         filters.change(
             on_filter_change,
-            inputs=[filters, history_meta, chat],
+            inputs=[filters, show_local, history_meta],
+            outputs=[transcript_box],
+        )
+        show_local.change(
+            on_filter_change,
+            inputs=[filters, show_local, history_meta],
             outputs=[transcript_box],
         )
 
