@@ -1,17 +1,8 @@
-// Program.cs
-// .NET 8 console app built as a DLL (UseAppHost=false)
-// Simplified: no TIFF stage, no image preprocessing. Directly OCR PDFs.
-// No 'using' statements—everything disposed via try/finally with DisposeQuietly().
-// Drop the built DLL into the same folder as Atalasoft 11.5 DLLs + license files.
-// Run with: dotnet OcrBatchDemo.dll
-
 using System;
 using System.IO;
 using System.Linq;
 using System.Diagnostics;
 using System.Globalization;
-using System.Collections.Generic;
-
 using Atalasoft.Imaging;
 using Atalasoft.Imaging.Codec;
 using Atalasoft.Imaging.Codec.Pdf;
@@ -34,7 +25,6 @@ internal static class Program
         Directory.CreateDirectory(OUTPUT_DIR);
         if (!Directory.Exists(OMNIPAGE_RESOURCES)) { Console.Error.WriteLine($"OmniPage resources missing: {OMNIPAGE_RESOURCES}"); return 3; }
 
-        // Make sure the PDF decoder rasterizes at a known DPI.
         EnsurePdfDecoderWithDpi(PDF_RASTER_DPI);
 
         var pdfs = Directory.EnumerateFiles(INPUT_DIR, "*.pdf", SearchOption.TopDirectoryOnly)
@@ -83,65 +73,30 @@ internal static class Program
 
             var overall = Stopwatch.StartNew();
 
-            // DIRECT OCR (no TIFF stage)
             string searchablePdf = Path.Combine(outDir, $"{name}.searchable.pdf");
             string plaintext     = Path.Combine(outDir, $"{name}.txt");
             string layoutJson    = Path.Combine(outDir, $"{name}.layout.json");
 
             OmniPageLoader loader = null;
             OmniPageEngine engine = null;
-            ImageSource images = null;          // FileSystemImageSource over the PDF
+            ImageSource images = null;
             PdfTranslator pdfTranslator = null;
             TextTranslator textTranslator = null;
 
-            var perPage = new List<(int page, double ms)>();
-            int pageCount = 0;
-
             try
             {
-                // Set up OCR engine + resources
+                // Setup engine
                 loader = new OmniPageLoader(OMNIPAGE_RESOURCES);
                 engine = new OmniPageEngine();
                 engine.RecognitionCultures = new[] { new CultureInfo(OCR_LANGUAGE) };
 
-                // Multi-page source directly from the PDF
+                // PDF is a multi-page image source
                 images = new FileSystemImageSource(new[] { pdfPath }, true);
-                pageCount = images.TotalImages;
 
-                // 1) Searchable PDF with per-page timing
+                // 1) Searchable PDF
                 var swPdf = Stopwatch.StartNew();
                 pdfTranslator = new PdfTranslator();
-
-                // Page timing using PageConstructing
-                var pageTimer = new Stopwatch();
-                int current = -1;
-
-                // Attach handler, but keep reference so we can detach safely
-                EventHandler<PageEventArgs> handler = (s, e) =>
-                {
-                    if (pageTimer.IsRunning)
-                    {
-                        pageTimer.Stop();
-                        perPage.Add((current + 1, pageTimer.Elapsed.TotalMilliseconds));
-                    }
-                    current = e.PageIndex;
-                    pageTimer.Restart();
-                };
-
-                try
-                {
-                    pdfTranslator.PageConstructing += handler;
-                    engine.Translate(images, "application/pdf", searchablePdf, pdfTranslator);
-                    if (pageTimer.IsRunning)
-                    {
-                        pageTimer.Stop();
-                        perPage.Add((current + 1, pageTimer.Elapsed.TotalMilliseconds));
-                    }
-                }
-                finally
-                {
-                    pdfTranslator.PageConstructing -= handler;
-                }
+                engine.Translate(images, "application/pdf", searchablePdf, pdfTranslator);
                 swPdf.Stop();
                 Log(log, $"OCR->PDF : {swPdf.Elapsed.TotalMilliseconds:n0} ms");
 
@@ -158,25 +113,20 @@ internal static class Program
                     var swJson = Stopwatch.StartNew();
                     TryJsonLayout(engine, images, layoutJson);
                     swJson.Stop();
-                    Log(log, $"OCR->JSON: {swJson.Elapsed.TotalMilliseconds:n0} ms (optional)");
+                    Log(log, $"OCR->JSON: {swJson.Elapsed.TotalMilliseconds:n0} ms");
                 }
             }
             finally
             {
                 DisposeQuietly(textTranslator);
                 DisposeQuietly(pdfTranslator);
-                DisposeQuietly(images);   // safe even if not IDisposable
+                DisposeQuietly(images);
                 DisposeQuietly(engine);
                 DisposeQuietly(loader);
             }
 
             overall.Stop();
             Log(log, $"Overall   : {overall.Elapsed.TotalMilliseconds:n0} ms");
-            Log(log, "");
-
-            Log(log, $"Pages     : {pageCount}");
-            Log(log, "Per-page timings (PDF translation):");
-            foreach (var p in perPage) Log(log, $"  Page {p.page:000}: {p.ms:n0} ms");
 
             Console.WriteLine($"OK: {name}");
         }
@@ -188,7 +138,6 @@ internal static class Program
 
     private static void EnsurePdfDecoderWithDpi(int dpi)
     {
-        // Register or update PdfDecoder’s Resolution so the PDF rasterizes at the desired DPI.
         for (int i = 0; i < RegisteredDecoders.Decoders.Count; i++)
         {
             var existing = RegisteredDecoders.Decoders[i] as PdfDecoder;
@@ -201,7 +150,6 @@ internal static class Program
     {
         try
         {
-            // Optional JSON layout translator (if WebControls OCR assembly is present)
             var t = Type.GetType("Atalasoft.Imaging.WebControls.OCR.JsonTranslator, Atalasoft.dotImage.WebControls", throwOnError: false);
             if (t == null) return;
 
@@ -218,7 +166,7 @@ internal static class Program
         }
         catch
         {
-            // optional; ignore if not available
+            // ignore optional JSON output
         }
     }
 
