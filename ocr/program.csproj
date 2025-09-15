@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <UseAppHost>false</UseAppHost>        <!-- produce a DLL runnable via: dotnet OcrBatchDemo.dll -->
+    <PlatformTarget>x64</PlatformTarget>  <!-- match Atalasoft .x64 assemblies -->
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PublishTrimmed>false</PublishTrimmed>
+  </PropertyGroup>
+
+  <!-- If you're dropping vendor DLLs next to the app and don't want NuGet,
+       you can remove these PackageReferences and keep only the local DLLs.
+       Using NuGet is fine too. -->
+  <ItemGroup>
+    <PackageReference Include="Atalasoft.dotImage.x64" Version="11.5.0.7296" />
+    <PackageReference Include="Atalasoft.dotImage.PdfReader.x64" Version="11.5.0.7296" />
+    <PackageReference Include="Atalasoft.dotImage.Ocr.x64" Version="11.5.0.7296" />
+    <PackageReference Include="Atalasoft.dotImage.Ocr.OmniPage.x64" Version="11.5.0.7296" />
+    <PackageReference Include="Atalasoft.dotImage.AdvancedDocClean.x64" Version="11.5.0.7296" />
+    <!-- Optional (for layout JSON) -->
+    <PackageReference Include="Atalasoft.dotImage.WebControls.x64" Version="11.5.0.7296" />
+  </ItemGroup>
+</Project>
