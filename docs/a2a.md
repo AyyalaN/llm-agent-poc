@@ -34,19 +34,16 @@ Notes:
 ⸻
 
 10) Top A2A resources & links (Python-friendly)
-	•	Official: Google announcement — why A2A exists, goals, and positioning.  ￼
-	•	ADK A2A Intro — mental model + workflow (server/client roles).  ￼
+	•	Official: Google announcement — why A2A exists, goals, and positioning.[https://developers.googleblog.com/en/a2a-a-new-era-of-agent-interoperability/?utm_source=chatgpt.com]
+	•	ADK A2A Intro — mental model + workflow (server/client roles).[https://google.github.io/adk-docs/a2a/intro/?utm_source=chatgpt.com]
 	•	ADK Quickstarts —
-	•	Exposing (use to_a2a() to publish your agent).  ￼
-	•	Consuming (call other agents via A2A).  ￼
-	•	LangGraph Server A2A endpoint — native /a2a/{assistant_id} support.  ￼
-	•	Codelab: MCP + ADK + A2A — end-to-end, with security callouts.  ￼
-	•	Background: MCP spec — know when to use MCP (tools/resources) vs A2A (peer agents).  ￼
-	•	Security perspective on MCP — helpful for designing A2A-adjacent controls (authZ, audit, rate limits).  ￼
-	•	LangGraph + A2A tutorial (community) — step-by-step enabling a LangGraph agent for A2A.  ￼
-	•	Microsoft stance on A2A — signals of alignment with AutoGen/Semantic Kernel ecosystems.  ￼
+	•	Exposing (use to_a2a() to publish your agent).[https://google.github.io/adk-docs/a2a/quickstart-exposing/?utm_source=chatgpt.com]
+	•	Consuming (call other agents via A2A).[https://google.github.io/adk-docs/a2a/quickstart-consuming/?utm_source=chatgpt.com]
+	•	LangGraph Server A2A endpoint — native /a2a/{assistant_id} support.[https://docs.langchain.com/langgraph-platform/server-a2a?utm_source=chatgpt.com]
+	•	LangGraph + A2A tutorial (community) — step-by-step enabling a LangGraph agent for A2A.[https://a2aprotocol.ai/blog/a2a-langraph-tutorial-20250513?utm_source=chatgpt.com]
+	•	Microsoft stance on A2A — signals of alignment with AutoGen/Semantic Kernel ecosystems.[https://www.microsoft.com/en-us/microsoft-cloud/blog/2025/05/07/empowering-multi-agent-apps-with-the-open-agent2agent-a2a-protocol/?utm_source=chatgpt.com]
 
-Optional reading: “Awesome A2A” curated list for ecosystem tooling and samples; stay cautious about quality—treat as a discovery index, not canonical docs.  ￼
+Optional reading: “Awesome A2A” curated list for ecosystem tooling and samples; stay cautious about quality—treat as a discovery index, not canonical docs.[https://github.com/ai-boost/awesome-a2a?utm_source=chatgpt.com]
 
 ⸻
 
